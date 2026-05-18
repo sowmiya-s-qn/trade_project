@@ -1,13 +1,11 @@
 import os
-import re
-import json
 import hashlib
 from urllib.parse import urljoin, urlparse
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
 
-from bs4 import BeautifulSoup
+from scrapy_playwright.page import PageMethod
 
 from tools.parser_tool.parser import ProductionParserEngine
 
@@ -16,9 +14,7 @@ class ProductionTradeSpider(scrapy.Spider):
 
     name = "production_trade_spider"
 
-
     custom_settings = {
-
 
         "CONCURRENT_REQUESTS": 16,
 
@@ -36,6 +32,7 @@ class ProductionTradeSpider(scrapy.Spider):
 
         "DOWNLOAD_TIMEOUT": 60,
 
+        "LOG_LEVEL": "INFO",
 
         "TWISTED_REACTOR":
             "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
@@ -53,12 +50,11 @@ class ProductionTradeSpider(scrapy.Spider):
 
             "User-Agent":
                 "Mozilla/5.0"
-        },
-
-        "LOG_LEVEL": "INFO"
+        }
     }
 
     def __init__(
+
         self,
         start_url=None,
         dynamic=False,
@@ -71,7 +67,6 @@ class ProductionTradeSpider(scrapy.Spider):
         self.start_urls = [start_url]
 
         self.allowed_domains = [
-
             urlparse(start_url).netloc
         ]
 
@@ -105,13 +100,10 @@ class ProductionTradeSpider(scrapy.Spider):
 
         url = url.lower()
 
-        for ext in self.document_extensions:
-
-            if url.endswith(ext):
-                return True
-
-        return False
-
+        return any(
+            url.endswith(ext)
+            for ext in self.document_extensions
+        )
 
     def generate_filename(self, url):
 
@@ -130,7 +122,6 @@ class ProductionTradeSpider(scrapy.Spider):
 
         return f"{url_hash}{extension}"
 
-
     def start_requests(self):
 
         for url in self.start_urls:
@@ -141,38 +132,23 @@ class ProductionTradeSpider(scrapy.Spider):
 
                 callback=self.parse,
 
+                errback=self.handle_error,
+
                 meta={
 
-                    "playwright": self.dynamic
+                    "playwright": self.dynamic,
+
+                    "playwright_page_methods": [
+
+                        PageMethod(
+                            "wait_for_timeout",
+                            3000
+                        )
+                    ]
                 }
             )
 
-
-    def download_document(
-        self,
-        response
-    ):
-
-        url = response.url
-
-        filename = self.generate_filename(
-            url
-        )
-
-        save_path = os.path.join(
-            self.download_path,
-            filename
-        )
-
-        with open(save_path, "wb") as f:
-
-            f.write(response.body)
-
-        print(f"\n[DOWNLOADED] {url}")
-
-        return save_path
-
-    def save_html(
+    def save_file(
         self,
         response
     ):
@@ -186,13 +162,13 @@ class ProductionTradeSpider(scrapy.Spider):
             filename
         )
 
-        with open(
-            save_path,
-            "w",
-            encoding="utf-8"
-        ) as f:
+        mode = "wb"
 
-            f.write(response.text)
+        content = response.body
+
+        with open(save_path, mode) as f:
+
+            f.write(content)
 
         return save_path
 
@@ -208,10 +184,7 @@ class ProductionTradeSpider(scrapy.Spider):
             )
 
             print(
-                "\n[PARSED]",
-                result.get(
-                    "document_type"
-                )
+                f"\n[PARSED] {file_path}"
             )
 
             return result
@@ -223,7 +196,6 @@ class ProductionTradeSpider(scrapy.Spider):
             )
 
             return None
-
 
     def parse(
         self,
@@ -239,94 +211,70 @@ class ProductionTradeSpider(scrapy.Spider):
 
         print(f"\n[CRAWLING] {url}")
 
-        if self.is_document(url):
-
-            downloaded_file = (
-                self.download_document(
-                    response
-                )
-            )
-
-            self.process_document(
-                downloaded_file
-            )
-
-            return
-
-
-        html_path = self.save_html(
+        saved_file = self.save_file(
             response
         )
 
         self.process_document(
-            html_path
+            saved_file
         )
 
+        links = response.css(
+            "a::attr(href)"
+        ).getall()
 
-        soup = BeautifulSoup(
-            response.text,
-            "lxml"
-        )
-
-        links = soup.find_all(
-            "a",
-            href=True
-        )
-
-        for link in links:
-
-            href = link["href"]
+        for href in links:
 
             full_url = urljoin(
                 response.url,
                 href
             )
 
-            parsed = urlparse(
-                full_url
-            )
-
+            parsed = urlparse(full_url)
 
             if (
                 parsed.netloc
                 not in self.allowed_domains
             ):
-
                 continue
 
-
-            normalized = (
-                parsed.scheme
-                + "://"
-                + parsed.netloc
-                + parsed.path
-            )
-
-            if normalized in self.visited_urls:
+            if full_url in self.visited_urls:
                 continue
-
 
             yield scrapy.Request(
 
-                url=normalized,
+                url=full_url,
 
                 callback=self.parse,
 
-                dont_filter=True,
+                errback=self.handle_error,
 
                 meta={
 
-                    "playwright":
-                        self.dynamic
+                    "playwright": self.dynamic,
+
+                    "playwright_page_methods": [
+
+                        PageMethod(
+                            "wait_for_timeout",
+                            3000
+                        )
+                    ]
                 }
             )
+
+    def handle_error(self, failure):
+
+        print(
+            f"\n[REQUEST ERROR] {failure}"
+        )
 
 
 if __name__ == "__main__":
 
     START_URL = "https://www.dgft.gov.in/"
 
-    DYNAMIC_SITE = False
+    DYNAMIC_SITE = True
 
     process = CrawlerProcess()
 
