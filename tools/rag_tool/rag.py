@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 
 import anthropic
 
-from pypdf import PdfReader
-
 from sentence_transformers import (
     SentenceTransformer
 )
@@ -20,6 +18,10 @@ from qdrant_client.models import (
     VectorParams,
     Distance,
     PointStruct
+)
+
+from tools.database_tool.database import (
+    PostgresDatabaseTool
 )
 
 
@@ -40,7 +42,6 @@ class TradeRAGTool:
         self.embedding_model = (
 
             SentenceTransformer(
-
                 "all-MiniLM-L6-v2"
             )
         )
@@ -65,6 +66,10 @@ class TradeRAGTool:
 
         self.collection_name = (
             "trade_intelligence"
+        )
+
+        self.database_tool = (
+            PostgresDatabaseTool()
         )
 
         self.create_collection()
@@ -99,14 +104,20 @@ class TradeRAGTool:
             )
 
             print(
-                f"Collection '{self.collection_name}' created"
+
+                f"\n[QDRANT] "
+                f"Collection created: "
+                f"{self.collection_name}"
             )
 
         else:
 
             print(
-                f"Collection '{self.collection_name}' already exists"
+
+                f"\n[QDRANT] "
+                f"Collection already exists"
             )
+
     def generate_embedding(
 
         self,
@@ -123,150 +134,54 @@ class TradeRAGTool:
 
         return embedding.tolist()
 
-    def load_pdfs(
+    def ingest_from_postgres(
 
         self,
 
-        pdf_folder="data/pdfs"
+        batch_size=50
     ):
 
-        documents = []
+        documents = (
 
-        for file_name in os.listdir(
-            pdf_folder
-        ):
-
-            if file_name.endswith(".pdf"):
-
-                file_path = os.path.join(
-
-                    pdf_folder,
-
-                    file_name
-                )
-
-                print(
-                    f"Reading: {file_name}"
-                )
-
-                try:
-
-                    reader = PdfReader(
-                        file_path
-                    )
-
-                    text = ""
-
-                    for page in reader.pages:
-
-                        extracted = (
-                            page.extract_text()
-                        )
-
-                        if extracted:
-
-                            text += extracted + "\n"
-
-                    documents.append({
-
-                        "file_name":
-                            file_name,
-
-                        "text":
-                            text
-                    })
-
-                except Exception as error:
-
-                    print(
-
-                        f"Error reading {file_name}: {error}"
-                    )
-
-        return documents
-
-    def chunk_text(
-
-        self,
-
-        text,
-
-        chunk_size=300
-    ):
-
-        chunks = []
-
-        text = text.replace(
-            "\n",
-            " "
+            self.database_tool
+            .get_all_documents()
         )
-
-        words = text.split()
-
-        current_chunk = []
-
-        current_length = 0
-
-        for word in words:
-
-            current_chunk.append(word)
-
-            current_length += len(word)
-
-            if current_length >= chunk_size:
-
-                chunks.append(
-
-                    " ".join(
-                        current_chunk
-                    )
-                )
-
-                current_chunk = []
-
-                current_length = 0
-
-        if current_chunk:
-
-            chunks.append(
-
-                " ".join(
-                    current_chunk
-                )
-            )
-
-        return chunks
-
-    def ingest_pdfs(self):
-        documents = self.load_pdfs()
-
-        batch_size = 50
-
-        points_batch = []
 
         total_chunks = 0
 
+        points_batch = []
+
         for document in documents:
 
-            print(
-                f"Ingesting: {document['file_name']}"
+            chunks = (
+
+                self.database_tool
+                .get_chunks_by_hash(
+
+                    document.document_hash
+                )
             )
 
-            chunks = self.chunk_text(
+            print(
 
-                document["text"]
+                f"\n[INGESTING] "
+                f"{document.document_hash}"
             )
 
             for chunk in chunks:
 
-                if len(chunk.strip()) < 20:
+                chunk_text = (
+                    chunk.chunk_text
+                )
+
+                if len(chunk_text.strip()) < 20:
 
                     continue
 
                 embedding = (
 
                     self.generate_embedding(
-                        chunk
+                        chunk_text
                     )
                 )
 
@@ -278,16 +193,23 @@ class TradeRAGTool:
 
                     payload={
 
+                        "document_hash":
+                            document.document_hash,
+
+                        "document_type":
+                            document.document_type,
+
+                        "source_url":
+                            document.source_url,
+
+                        "chunk_index":
+                            chunk.chunk_index,
+
                         "chunk_text":
-                            chunk,
+                            chunk_text,
 
-                        "metadata": {
-
-                            "source":
-                                document[
-                                    "file_name"
-                                ]
-                        }
+                        "metadata":
+                            document.metadata_json
                     }
                 )
 
@@ -306,7 +228,9 @@ class TradeRAGTool:
                     )
 
                     print(
-                        f"Inserted {total_chunks} chunks"
+
+                        f"\n[QDRANT] "
+                        f"{total_chunks} chunks inserted"
                     )
 
                     points_batch = []
@@ -322,8 +246,19 @@ class TradeRAGTool:
             )
 
         print(
-            "PDF ingestion completed"
+
+            f"\n[QDRANT] "
+            f"Ingestion completed"
         )
+
+        return {
+
+            "status":
+                "completed",
+
+            "total_chunks":
+                total_chunks
+        }
 
     def retrieve_documents(
 
@@ -366,6 +301,26 @@ class TradeRAGTool:
                 "score":
                     result.score,
 
+                "document_hash":
+                    payload.get(
+                        "document_hash"
+                    ),
+
+                "document_type":
+                    payload.get(
+                        "document_type"
+                    ),
+
+                "source_url":
+                    payload.get(
+                        "source_url"
+                    ),
+
+                "chunk_index":
+                    payload.get(
+                        "chunk_index"
+                    ),
+
                 "chunk_text":
                     payload.get(
                         "chunk_text"
@@ -396,7 +351,14 @@ class TradeRAGTool:
 
                 f"\nDOCUMENT {index + 1}\n"
 
-                f"Source: {doc['metadata']['source']}\n\n"
+                f"Document Type: "
+                f"{doc['document_type']}\n"
+
+                f"Source URL: "
+                f"{doc['source_url']}\n"
+
+                f"Chunk Index: "
+                f"{doc['chunk_index']}\n\n"
 
                 f"{doc['chunk_text']}\n"
             )
@@ -414,13 +376,15 @@ class TradeRAGTool:
 
         prompt = f"""
 
-You are an international trade intelligence assistant.
+You are an international trade
+intelligence assistant.
 
 Use ONLY the provided context
 to answer the user query.
 
 If information is unavailable,
 say:
+
 "Information not found in knowledge base."
 
 
@@ -431,15 +395,16 @@ USER QUERY:
 CONTEXT:
 {context}
 
+
 Provide:
 - tariffs
 - import/export regulations
 - compliance requirements
-- documentation requirements
-- logistics considerations
-- trade policies
 - customs procedures
+- logistics considerations
+- trade policy insights
 - subsidy information
+- documentation requirements
 
 """
 
@@ -457,15 +422,18 @@ Provide:
 
                     {
 
-                        "role": "user",
+                        "role":
+                            "user",
 
-                        "content": prompt
+                        "content":
+                            prompt
                     }
                 ]
             )
         )
 
         return response.content[0].text
+
     def ask(
 
         self,
@@ -506,10 +474,16 @@ Provide:
                 answer
         }
 
+    def close(self):
+
+        self.database_tool.close()
+
 
 if __name__ == "__main__":
 
     rag = TradeRAGTool()
+
+    rag.ingest_from_postgres()
 
     query = (
 
@@ -518,10 +492,8 @@ if __name__ == "__main__":
 
     result = rag.ask(query)
 
-    print("\n")
-
-    print("FINAL ANSWER")
-
-    print("\n")
+    print("\nFINAL ANSWER\n")
 
     print(result["answer"])
+
+    rag.close()
