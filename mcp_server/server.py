@@ -1,199 +1,223 @@
-from fastmcp import FastMCP
-
-from tools.webscraper_tool.engine import (
-    ProductionScraperEngine
+import asyncio
+from mcp.server.fastmcp import FastMCP
+from sqlalchemy import text
+from tools.calculator_tool.calculator import TradeCostCalculator
+from tools.database_tool.database import DocumentDB, database
+from tools.parser_tool.parser import ingest_to_postgresql
+from tools.rag_tool.rag1 import ask_rag, index_documents
+from tools.webscraper_tool.scraper import (
+    run_advanced_scraper,
+    run_indiafilings_crawler,
+    run_simple_scraper,
 )
 
-from tools.parser_tool.parser import (
-    ProductionParserEngine
-)
-
-from tools.database_tool.database import (
-    PostgresDatabaseTool
-)
-
-from tools.rag_tool.rag import (
-    TradeRAGTool
-)
-
-from tools.calculator_tool.calculator import (
-    TradeCostCalculator
-)
-
-
-mcp = FastMCP(
-    name="trade_intelligence_mcp"
-)
-
-
-scraper_engine = (
-    ProductionScraperEngine()
-)
-
-parser_engine = (
-    ProductionParserEngine()
-)
-
-database_tool = (
-    PostgresDatabaseTool()
-)
-
-rag_tool = (
-    TradeRAGTool()
-)
-
-calculator_tool = (
-    TradeCostCalculator()
-)
-
-
-database_tool.create_tables()
-
+mcp = FastMCP("Trade MCP Server")
+calculator = TradeCostCalculator()
 
 @mcp.tool()
-def scrape_website(
-
-    url: str,
-
-    dynamic: bool = False
-):
-
-    return scraper_engine.scrape(
-
-        url=url,
-
-        dynamic=dynamic
+async def scrape_trade_documents() -> dict:
+    """
+    Triggers background web scraping pipelines simultaneously.
+    Downloads policy data, inspects deep-table grids, and saves structural markdown logs.
+    """
+    await asyncio.gather(
+        run_simple_scraper(),
+        run_advanced_scraper(),
+        run_indiafilings_crawler(),
     )
-
-
-@mcp.tool()
-def parse_document(
-
-    file_path: str
-):
-
-    return parser_engine.parse(
-        file_path
-    )
-
-
-@mcp.tool()
-def insert_document(
-
-    source_url: str,
-
-    file_path: str
-):
-
-    parsed_result = (
-        parser_engine.parse(
-            file_path
-        )
-    )
-
-    document_id = (
-
-        database_tool.insert_document(
-
-            source_url=
-                source_url,
-
-            file_path=
-                file_path,
-
-            parsed_result=
-                parsed_result
-        )
-    )
-
-    database_tool.insert_chunks(
-
-        document_hash=
-            parsed_result[
-                "document_hash"
-            ],
-
-        chunks=
-            parsed_result[
-                "chunks"
-            ]
-    )
-
     return {
+        "status": "success",
+        "message": "All scraping background routines completed successfully."
+    }
 
-        "status":
-            "inserted",
+@mcp.tool()
+def parse_documents() -> dict:
+    """
+    Scans internal data staging paths (PDFs, Excel files, CSVs, TXT files),
+    extracts raw and grid tabular data, and batch inserts records into PostgreSQL.
+    """
+    folders = [
+        "data/pdfs",
+        "data/xlsx",
+        "data/csv",
+        "data/unified_downloads",
+    ]
+    ingest_to_postgresql(folders)
+    return {
+        "status": "success",
+        "message": "Document parsing complete. Staging folders synchronized to PostgreSQL."
+    }
 
-        "document_id":
-            document_id
+@mcp.tool()
+def database_health_check() -> dict:
+    """
+    Validates operational performance connectivity to the primary PostgreSQL relational database.
+    """
+    try:
+        with database() as db:
+            db.execute(text("SELECT 1"))
+        return {
+            "status": "success",
+            "message": "Database ping acknowledged. Connection healthy."
+        }
+    except Exception as error:
+        return {
+            "status": "failed",
+            "error": str(error)
+        }
+
+
+@mcp.tool()
+def get_document_count() -> dict:
+    """
+    Returns the total number of document records currently stored inside the database.
+    """
+    with database() as db:
+        count = db.query(DocumentDB).count()
+    return {"total_documents": count}
+
+
+@mcp.tool()
+def list_documents(limit: int = 10) -> list:
+    """
+    Retrieves metadata for the most recent files indexed in the database up to a defined limit.
+    """
+    with database() as db:
+        documents = db.query(DocumentDB).limit(limit).all()
+        results = []
+        for doc in documents:
+            results.append({
+                "id": doc.id,
+                "title": doc.title,
+                "source_type": doc.source_type,
+                "source_path": doc.source_path,
+            })
+    return results
+
+
+@mcp.tool()
+def search_documents(keyword: str) -> list:
+    """
+    Performs an intensive, case-insensitive substring search across raw document text data.
+    """
+    with database() as db:
+        documents = (
+            db.query(DocumentDB)
+            .filter(DocumentDB.content.ilike(f"%{keyword}%"))
+            .limit(20)
+            .all()
+        )
+        results = []
+        for doc in documents:
+            results.append({
+                "id": doc.id,
+                "title": doc.title,
+                "source_type": doc.source_type,
+                "source_path": doc.source_path,
+            })
+    return results
+
+
+@mcp.tool()
+def delete_document(document_id: str) -> dict:
+    """
+    Permanently purges a specific document file record from the database using its primary ID.
+    """
+    with database() as db:
+        document = (
+            db.query(DocumentDB)
+            .filter(DocumentDB.id == document_id)
+            .first()
+        )
+        if not document:
+            return {
+                "status": "failed",
+                "message": f"Document with ID {document_id} was not located."
+            }
+        db.delete(document)
+        db.commit()
+    return {
+        "status": "success",
+        "deleted_document_id": document_id
+    }
+
+@mcp.tool()
+def build_vector_index() -> dict:
+    """
+    Chunks document records, builds numerical embeddings, and updates the Qdrant vector database.
+    """
+    index_documents()
+    return {
+        "status": "success",
+        "message": "Vector indexing completed. Qdrant payload collections updated successfully."
     }
 
 
 @mcp.tool()
-def ingest_to_vector_db():
-
-    return rag_tool.ingest_from_postgres()
-
-
-@mcp.tool()
-def search_trade_knowledge(
-
-    query: str
-):
-
-    return rag_tool.ask(query)
-
+def ask_trade_rag(question: str) -> dict:
+    """
+    Asks a natural language query against the vector database using context-driven RAG.
+    """
+    answer = ask_rag(question)
+    return {
+        "question": question,
+        "answer": answer
+    }
 
 @mcp.tool()
 def calculate_import_cost(
-
     product_cost: float,
-
     quantity: int,
-
     shipping_cost: float,
-
     insurance_cost: float,
-
     customs_duty_percent: float,
+    gst_percent: float,
+) -> dict:
+    """
+    Computes landed cost parameters for import shipments including custom tariffs, CIF values, and GST outlays.
+    """
+    return calculator.calculate_import_cost(
+        product_cost=product_cost,
+        quantity=quantity,
+        shipping_cost=shipping_cost,
+        insurance_cost=insurance_cost,
+        customs_duty_percent=customs_duty_percent,
+        gst_percent=gst_percent,
+    )
 
-    gst_percent: float
-):
-
-    return (
-
-        calculator_tool
-        .calculate_import_cost(
-
-            product_cost=
-                product_cost,
-
-            quantity=
-                quantity,
-
-            shipping_cost=
-                shipping_cost,
-
-            insurance_cost=
-                insurance_cost,
-
-            customs_duty_percent=
-                customs_duty_percent,
-
-            gst_percent=
-                gst_percent
-        )
+@mcp.tool()
+def calculate_export_cost(
+    product_cost: float,
+    quantity: int,
+    packaging_cost: float,
+    shipping_cost: float,
+    insurance_cost: float,
+) -> dict:
+    """
+    Calculates operational prep costs, freight distribution values, and total layout profiles for outward shipments.
+    """
+    return calculator.calculate_export_cost(
+        product_cost=product_cost,
+        quantity=quantity,
+        packaging_cost=packaging_cost,
+        shipping_cost=shipping_cost,
+        insurance_cost=insurance_cost,
     )
 
 
 @mcp.tool()
-def health_check():
-
-    return {
-        "status": "healthy"
-    }
+def calculate_profit_margin(
+    selling_price: float,
+    total_cost: float,
+) -> dict:
+    """
+    Analyzes trading financial transactions, generating net profit sums and clean percentage margin metrics.
+    """
+    return calculator.calculate_profit_margin(
+        selling_price=selling_price,
+        total_cost=total_cost,
+    )
 
 
 if __name__ == "__main__":
-
     mcp.run()
